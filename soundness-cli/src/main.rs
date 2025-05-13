@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write; // Added for writing to file
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -61,6 +62,12 @@ enum Commands {
         /// Name for the imported key pair
         #[arg(short, long)]
         name: String,
+    },
+    /// Generate multiple key pairs without passwords and output public keys
+    BatchGen {
+        /// Number of keys to generate
+        #[arg(short, long, value_name = "COUNT")]
+        count: u32,
     },
     /// Send a proof and ELF file to the server
     Send {
@@ -234,6 +241,95 @@ fn generate_key_pair(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn batch_gen_keys(count: u32) -> Result<()> {
+    if count == 0 {
+        println!("Number of keys to generate must be greater than 0.");
+        return Ok(());
+    }
+
+    let mut key_store = load_key_store()?;
+    let mut public_keys_to_write = Vec::new();
+
+    println!("Generating {} key pair(s)...", count);
+    let pb = ProgressBar::new(count as u64);
+    let pb_style = ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+        .unwrap_or_else(|_| ProgressStyle::default_bar()) // Fallback style
+        .progress_chars("=> ");
+    pb.set_style(pb_style.clone());
+    pb.set_message("Generating keys");
+
+
+    let mut next_key_idx_base = 0;
+    // Find a starting index for batch_key_X that doesn't exist yet.
+    // This helps avoid immediate collisions if batch-gen is run multiple times.
+    loop {
+        let potential_name = format!("batch_key_{}", next_key_idx_base);
+        if !key_store.keys.contains_key(&potential_name) {
+            break;
+        }
+        next_key_idx_base += 1;
+    }
+
+    for i in 0..count {
+        let mut current_name_candidate_idx = next_key_idx_base + i;
+        let mut final_key_name;
+        // Ensure unique name even if there are gaps or manual additions matching the pattern
+        loop {
+            final_key_name = format!("batch_key_{}", current_name_candidate_idx);
+            if !key_store.keys.contains_key(&final_key_name) {
+                break;
+            }
+            current_name_candidate_idx += 1; // Increment and try next index
+        }
+        
+        // Generate a new key pair
+        let mut rng = OsRng;
+        let signing_key = SigningKey::generate(&mut rng); // Secret key is generated here
+        let verifying_key = signing_key.verifying_key();
+        let public_key_bytes = verifying_key.to_bytes();
+        let public_key_string = BASE64.encode(&public_key_bytes);
+
+        // Encrypt secret key with empty password
+        let secret_key_bytes = signing_key.to_bytes();
+        let empty_password = ""; // 使用空密码
+        let encrypted_secret = encrypt_secret_key(&secret_key_bytes, empty_password)
+            .expect("Failed to encrypt secret key with empty password");
+        
+        // Store the key pair with an encrypted secret key (using empty password)
+        key_store.keys.insert(
+            final_key_name.clone(),
+            KeyPair {
+                public_key: public_key_bytes.to_vec(),
+                public_key_string: public_key_string.clone(),
+                encrypted_secret_key: Some(encrypted_secret), // 使用空密码加密
+            },
+        );
+        public_keys_to_write.push(public_key_string);
+        pb.inc(1);
+    }
+
+    pb.finish_with_message(format!("✅ Generated {} key pair(s)", count));
+
+    // Save the updated key store
+    save_key_store(&key_store)?;
+    println!("💾 Key store updated with new public keys.");
+
+    // Write public keys to public_keys.txt
+    let output_file_path = PathBuf::from("public_keys.txt");
+    let mut file = fs::File::create(&output_file_path)
+        .with_context(|| format!("Failed to create file: {}", output_file_path.display()))?;
+    
+    for pub_key_str in public_keys_to_write {
+        writeln!(file, "{}", pub_key_str)
+            .with_context(|| format!("Failed to write to file: {}", output_file_path.display()))?;
+    }
+    println!("🔑 All public keys written to {}", output_file_path.display());
+
+    Ok(())
+}
+
+
 fn list_keys() -> Result<()> {
     let key_store = load_key_store()?;
 
@@ -244,7 +340,12 @@ fn list_keys() -> Result<()> {
 
     println!("Available key pairs:");
     for (name, key_pair) in key_store.keys {
-        println!("- {} (Public key: {})", name, key_pair.public_key_string);
+        let secret_status = if key_pair.encrypted_secret_key.is_some() {
+            "(secret encrypted)"
+        } else {
+            "(secret not stored/encrypted)"
+        };
+        println!("- {} (Public key: {}) {}", name, key_pair.public_key_string, secret_status);
     }
     Ok(())
 }
@@ -267,7 +368,7 @@ fn sign_payload(payload: &[u8], key_name: &str) -> Result<Vec<u8>> {
     let encrypted_secret = key_pair
         .encrypted_secret_key
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Secret key not found for '{}'", key_name))?;
+        .ok_or_else(|| anyhow::anyhow!("Secret key not found or not encrypted for '{}'. Keys generated with 'batch-gen' do not store encrypted secrets and cannot be used for signing directly with this method.", key_name))?;
 
     // Create a new scope for the password guard to ensure it's dropped properly
     let password = {
@@ -331,7 +432,7 @@ fn export_key(name: &str) -> Result<()> {
     let encrypted_secret = key_pair
         .encrypted_secret_key
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Secret key not found for '{}'", name))?;
+        .ok_or_else(|| anyhow::anyhow!("Secret key not found or not encrypted for '{}'. Cannot export mnemonic.", name))?;
 
     // Prompt for password
     let password = prompt_password("Enter password to decrypt the secret key: ")
@@ -432,6 +533,9 @@ async fn main() -> Result<()> {
         }
         Commands::ImportKey { name } => {
             import_key(&name)?;
+        }
+        Commands::BatchGen { count } => {
+            batch_gen_keys(count)?;
         }
         Commands::Send {
             proof_file,
